@@ -240,6 +240,107 @@ class SNOMEDClient:
         return result is True
 
     # ------------------------------------------------------------------
+    # Axioms
+    # ------------------------------------------------------------------
+
+    def get_axioms(self, concept_id: str, *, view: str = "inferred") -> dict:
+        """
+        Retrieve the defining axioms for a concept: its IS-A parents and all
+        attribute-role relationships stored as FHIR properties.
+
+        Uses the **inferred** view by default, which matches what the SNOMED
+        browser displays under "Inferred Relationships".  The Ontoserver
+        ``normalForm`` property is the inferred short normal form (proximate
+        primitive parents + non-redundant own role groups) produced by the
+        classifier — not the stated OWL axioms.
+
+        Args:
+            concept_id: SNOMED CT Concept ID (e.g. "195967001").
+            view: Relationship view — "inferred" (default) uses the classifier-
+                  derived ``normalForm`` property; "stated" uses
+                  ``statedNormalForm`` (note: not all servers support this).
+
+        Returns:
+            Dict with keys:
+              - "code": concept ID
+              - "display": preferred term
+              - "sufficiently_defined": True if fully defined, False if primitive,
+                                        None if the server did not return this property
+              - "is_a": list of {"code", "display"} immediate inferred parent concepts
+              - "attributes": list of {"type_code", "type_display",
+                                       "value_code", "value_display"} role-attribute dicts
+        """
+        # normalForm  → inferred short normal form (matches SNOMED browser inferred view)
+        # statedNormalForm → stated short normal form (OWL axioms only)
+        # parent      → immediate inferred IS-A parents
+        normal_form_prop = "normalForm" if view == "inferred" else "statedNormalForm"
+        params = [
+            ("system", SNOMED_SYSTEM),
+            ("code", concept_id),
+            ("_format", "json"),
+            ("property", normal_form_prop),
+            ("property", "parent"),
+            ("property", "sufficientlyDefined"),
+        ]
+        data = self._get(f"{self.base}/CodeSystem/$lookup", params)
+        return self._parse_axioms(data, normal_form_prop=normal_form_prop)
+
+    def search_by_axiom(
+        self,
+        attribute_id: str,
+        value_id: str,
+        *,
+        term: str = None,
+        scope_ecl: str = None,
+        include_value_descendants: bool = True,
+        view: str = "inferred",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
+        """
+        Find concepts that have a specific attribute→value axiom relationship.
+
+        Builds an ECL attribute-refinement expression and executes it via
+        ValueSet/$expand.  Optionally combines with a free-text filter and/or
+        an ECL scope constraint.
+
+        Args:
+            attribute_id: SNOMED concept ID of the attribute type
+                          (e.g. "363698007" for "Finding site").
+            value_id: SNOMED concept ID of the attribute value target
+                      (e.g. "39607008" for "Lung structure").
+            term: Optional free-text filter applied on top of the axiom
+                  constraint (e.g. "pneumonia").
+            scope_ecl: Optional ECL expression to restrict the search domain
+                       (e.g. "<404684003" to limit to clinical findings only).
+            include_value_descendants: When True (default), also matches
+                                       concepts whose attribute value is any
+                                       descendant of value_id (<<value_id in ECL).
+            view: Relationship view — "inferred" (default) or "stated".
+            limit: Max results.
+            offset: Pagination offset.
+
+        Returns:
+            List of {"code": "...", "display": "..."} dicts.
+
+        Examples:
+            # Clinical findings with Finding site in lung structures
+            client.search_by_axiom("363698007", "39607008", scope_ecl="<404684003")
+
+            # Any concept caused by a bacterium, narrowed by text
+            client.search_by_axiom("246075003", "409822003", term="pneumonia")
+        """
+        value_expr = f"<<{value_id}" if include_value_descendants else value_id
+        ecl = (
+            f"{scope_ecl} : {attribute_id} = {value_expr}"
+            if scope_ecl
+            else f"* : {attribute_id} = {value_expr}"
+        )
+        if term:
+            return self.search(term, ecl=ecl, view=view, limit=limit, offset=offset)
+        return self.get_ecl(ecl, view=view, limit=limit, offset=offset)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -306,6 +407,122 @@ class SNOMEDClient:
                 if code:
                     result["properties"].append({"code": code, "value": value})
         return result
+
+    @staticmethod
+    def _parse_axioms(data: dict, *, normal_form_prop: str = "normalForm") -> dict:
+        result: dict = {
+            "code": None,
+            "display": None,
+            "sufficiently_defined": None,
+            "is_a": [],
+            "attributes": [],
+        }
+        for param in data.get("parameter", []):
+            name = param.get("name")
+            if name == "code":
+                result["code"] = param.get("valueCode")
+            elif name == "display":
+                result["display"] = param.get("valueString")
+            elif name == "property":
+                parts = {p["name"]: p for p in param.get("part", [])}
+                prop_code = parts.get("code", {}).get("valueCode", "")
+                value_part = parts.get("value", {})
+                value_code = value_part.get("valueCode")
+
+                if prop_code == "parent":
+                    if value_code:
+                        result["is_a"].append({"code": value_code, "display": ""})
+                elif prop_code == "sufficientlyDefined":
+                    val = next(
+                        (v for k, v in value_part.items() if k.startswith("value")),
+                        None,
+                    )
+                    result["sufficiently_defined"] = val
+                elif prop_code == normal_form_prop:
+                    norm_str = next(
+                        (v for k, v in value_part.items() if k.startswith("value")),
+                        None,
+                    )
+                    if isinstance(norm_str, str):
+                        result["attributes"] = SNOMEDClient._parse_normal_form_attributes(norm_str)
+        return result
+
+    @staticmethod
+    def _parse_normal_form_attributes(normal_form: str) -> list[dict]:
+        """
+        Extract attribute-value pairs from a SNOMED CT normalForm expression.
+
+        The normalForm returned by Ontoserver is the **inferred** short normal
+        form.  Its grammar looks like:
+
+          <<< conceptId|FSN|:{attrId|...|=valId|...|, attrId|...|=(complexExpr),...}
+          === primitiveParentId|...|+...  :{...},...
+
+        Each ``{...}`` block is a role group.  Within it, attribute-value pairs
+        are separated by commas **at the top level only** — values can themselves
+        be postcoordinated expressions wrapped in ``(...)`` containing nested
+        commas and ``=`` signs.  We parse only top-level pairs so that qualifiers
+        inside a complex value (e.g. ``Finding site = (Lung : Laterality = Side)``)
+        are not incorrectly extracted as standalone attributes.
+
+        For complex (postcoordinated) values, the primary concept ID is extracted
+        from the opening of the parenthesised expression.
+        """
+        attributes = []
+        # Each {…} block is one role group; note: no nested {…} appear inside (…)
+        role_groups = re.findall(r'\{([^}]+)\}', normal_form)
+        for group in role_groups:
+            # Split only at top-level commas — ignore commas inside (…)
+            for pair in SNOMEDClient._split_top_level(group, ","):
+                pair = pair.strip()
+                # Match: attrId|display|=<value>
+                m = re.match(r'^(\d+)\|([^|]*)\|=(.*)', pair, re.DOTALL)
+                if not m:
+                    continue
+                type_code, type_display, value_str = m.group(1), m.group(2), m.group(3).strip()
+
+                if value_str.startswith("("):
+                    # Postcoordinated value — extract the leading concept only
+                    inner = re.match(r'\((\d+)\|([^|]*)\|', value_str)
+                    if not inner:
+                        continue
+                    value_code, value_display = inner.group(1), inner.group(2)
+                else:
+                    # Simple concept value: id|display|
+                    simple = re.match(r'^(\d+)\|([^|]*)\|', value_str)
+                    if not simple:
+                        continue
+                    value_code, value_display = simple.group(1), simple.group(2)
+
+                attributes.append({
+                    "type_code": type_code,
+                    "type_display": type_display,
+                    "value_code": value_code,
+                    "value_display": value_display,
+                })
+        return attributes
+
+    @staticmethod
+    def _split_top_level(s: str, delimiter: str) -> list[str]:
+        """Split *s* by *delimiter* only at depth-0 (not inside parentheses)."""
+        parts: list[str] = []
+        depth = 0
+        buf: list[str] = []
+        for ch in s:
+            if ch == "(":
+                depth += 1
+                buf.append(ch)
+            elif ch == ")":
+                depth -= 1
+                buf.append(ch)
+            elif ch == delimiter and depth == 0:
+                parts.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            parts.append("".join(buf))
+        return parts
 
     @staticmethod
     def _param_value(data: dict, name: str):
