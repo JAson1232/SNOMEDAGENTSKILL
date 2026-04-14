@@ -217,6 +217,100 @@ GET /fhir/CodeSystem/$validate-code?url=http://snomed.info/sct&code=195967001&_f
 
 ---
 
+### 7. Get Axioms (Defining Relationships)
+
+Retrieve the defining axioms for a concept: its immediate IS-A parents and all attribute-role relationships (the inferred short normal form).
+
+```python
+axioms = client.get_axioms("195967001")
+
+print(axioms["display"])              # "Asthma"
+print(axioms["sufficiently_defined"]) # True / False / None
+for parent in axioms["is_a"]:
+    print(parent["code"], parent["display"])
+for attr in axioms["attributes"]:
+    print(attr["type_display"], "=", attr["value_display"])
+    # e.g. "Finding site = Lung structure"
+```
+
+Use `view="stated"` to fetch the stated normal form instead (not supported by all servers):
+```python
+axioms = client.get_axioms("195967001", view="stated")
+```
+
+**Direct HTTP:**
+```
+GET /fhir/CodeSystem/$lookup?system=http://snomed.info/sct&code=195967001
+  &property=normalForm&property=parent&property=sufficientlyDefined&_format=json
+```
+
+**Response fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | str | SNOMED concept ID |
+| `display` | str | Preferred term |
+| `sufficiently_defined` | bool \| None | `True` = fully defined; `False` = primitive; `None` = not returned by server |
+| `is_a` | list of `{"code", "display"}` | Immediate inferred (or stated) parent concepts |
+| `attributes` | list of `{"type_code", "type_display", "value_code", "value_display"}` | Role-attribute pairs from the normal form |
+
+> **Inferred vs. stated:** The inferred view (default) uses the `normalForm` property — the classifier-derived short normal form shown in the SNOMED browser under "Inferred Relationships". The stated view uses `statedNormalForm` (authored OWL axioms only); not all servers return this property.
+
+---
+
+### 8. Search by Axiom (Attribute→Value Relationship)
+
+Find all concepts that carry a specific attribute→value role relationship, optionally combined with a text filter or ECL scope.
+
+```python
+# All clinical findings with "Finding site" in (or descending from) "Lung structure"
+results = client.search_by_axiom(
+    attribute_id="363698007",   # Finding site
+    value_id="39607008",        # Lung structure
+    scope_ecl="<404684003",     # limit to Clinical findings
+)
+
+# Concepts caused by a bacterium, filtered by text
+results = client.search_by_axiom(
+    attribute_id="246075003",   # Causative agent
+    value_id="409822003",       # Bacterium
+    term="pneumonia",
+)
+
+# Exact value match only (no descendants)
+results = client.search_by_axiom(
+    attribute_id="363698007",
+    value_id="39607008",
+    include_value_descendants=False,
+)
+```
+
+**Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `attribute_id` | required | SNOMED concept ID of the attribute type (e.g. `"363698007"` for Finding site) |
+| `value_id` | required | SNOMED concept ID of the attribute value target |
+| `term` | `None` | Optional free-text filter applied on top of the axiom constraint |
+| `scope_ecl` | `None` | Optional ECL expression to restrict the search domain |
+| `include_value_descendants` | `True` | When `True`, matches concepts whose value is `value_id` or any of its descendants (`<<value_id`) |
+| `view` | `"inferred"` | Relationship view — `"inferred"` or `"stated"` |
+| `limit` | `20` | Max results |
+| `offset` | `0` | Pagination offset |
+
+**Useful attribute concept IDs:**
+| Concept ID | Attribute Name |
+|------------|----------------|
+| `363698007` | Finding site |
+| `246075003` | Causative agent |
+| `255234002` | After |
+| `116676008` | Associated morphology |
+| `363699004` | Direct device |
+| `246090004` | Associated finding |
+| `47429007`  | Associated with |
+| `370135005` | Pathological process |
+| `260686004` | Method |
+
+---
+
 ## Decision Guide: Choosing the Right Method
 
 | Goal | Method |
@@ -231,6 +325,10 @@ GET /fhir/CodeSystem/$validate-code?url=http://snomed.info/sct&code=195967001&_f
 | Complex query using stated relationships | `client.get_ecl("ecl expression", view="stated")` |
 | Check if concept A is a subtype of concept B | `client.is_subtype_of("A", "B")` |
 | Check if a concept ID is valid | `client.validate("conceptId")` |
+| Inspect a concept's parents and role attributes | `client.get_axioms("conceptId")` |
+| Inspect stated (authored) axioms only | `client.get_axioms("conceptId", view="stated")` |
+| Find concepts with a specific attribute→value pair | `client.search_by_axiom("attrId", "valueId")` |
+| Same, narrowed to a domain or free-text filter | `client.search_by_axiom("attrId", "valueId", scope_ecl="...", term="...")` |
 
 ---
 
